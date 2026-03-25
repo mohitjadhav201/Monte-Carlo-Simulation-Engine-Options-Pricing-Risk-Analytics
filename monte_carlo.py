@@ -12,6 +12,10 @@ from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.series import DataPoint
 from openpyxl.utils import get_column_letter
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from openpyxl.drawing.image import Image as XLImage
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -180,15 +184,24 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("**📈 Market Parameters**")
-    S0 = st.number_input("Initial Stock Price (S₀)", value=1394.70, min_value=1.0, step=0.1, format="%.2f")
-    K  = st.number_input("Strike Price (K)", value=1353.50, min_value=1.0, step=0.1, format="%.2f")
-    T  = st.number_input("Time to Maturity (T, years)", value=2.25, min_value=0.01, step=0.25, format="%.2f")
+    S0 = st.number_input("Initial Stock Price (S₀)", value=1458.70, min_value=1.0, step=0.1, format="%.2f")
+    K  = S0   # Strike Price is always equal to Initial Stock Price (ATM)
+    st.markdown(
+        f"<div style='background:rgba(13,71,161,0.25);border:1px solid rgba(100,181,246,0.3);"
+        f"border-radius:8px;padding:8px 12px;margin-bottom:8px;'>"
+        f"<span style='color:#90caf9;font-size:0.82rem;font-weight:600;'>Strike Price (K)</span><br>"
+        f"<span style='color:#64b5f6;font-size:1.1rem;font-weight:700;'>{K:,.2f}</span>"
+        f"<span style='color:rgba(255,255,255,0.45);font-size:0.72rem;'> &nbsp;= S₀ (ATM, locked)</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    T  = st.number_input("Time to Maturity (T, years)", value=2.0, min_value=0.01, step=0.25, format="%.2f")
 
     st.markdown("---")
     st.markdown("**📉 Rate Parameters**")
-    r  = st.number_input("Risk-free Rate (r, %)", value=5.84, min_value=0.0, max_value=50.0, step=0.01, format="%.2f") / 100
-    q  = st.number_input("Dividend Yield (q, %)", value=0.45, min_value=0.0, max_value=50.0, step=0.01, format="%.2f") / 100
-    sigma = st.number_input("Annual Volatility (σ, %)", value=32.64, min_value=0.1, max_value=200.0, step=0.01, format="%.2f") / 100
+    r  = st.number_input("Risk-free Rate (r, %)", value=6.53, min_value=0.0, max_value=50.0, step=0.01, format="%.2f") / 100
+    q  = st.number_input("Dividend Yield (q, %)", value=0.46, min_value=0.0, max_value=50.0, step=0.01, format="%.2f") / 100
+    sigma = st.number_input("Annual Volatility (σ, %)", value=30.61, min_value=0.1, max_value=200.0, step=0.01, format="%.2f") / 100
 
     st.markdown("---")
     st.markdown("**🔢 Simulation Settings**")
@@ -196,7 +209,7 @@ with st.sidebar:
     trading_days = st.number_input("Trading Days / Year", value=248, min_value=100, max_value=365, step=1)
     use_paths = st.checkbox("Generate Price Paths", value=True, help="Also simulate step-by-step paths for visualization")
     n_paths_display = st.slider("Paths to Display", 10, 200, 50) if use_paths else 50
-    seed = st.number_input("Random Seed (0 = random)", value=0, min_value=0, step=1)
+    seed = st.number_input("Random Seed (0 = use 42)", value=42, min_value=0, step=1)
 
     st.markdown("---")
     run_btn = st.button("▶ Run Simulation", use_container_width=True)
@@ -216,22 +229,27 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def run_simulation(S0, K, T, r, q, sigma, N, trading_days, use_paths, seed):
-    rng = np.random.default_rng(None if seed == 0 else int(seed))
+    # ── Exact multi-step GBM engine ───────────────────
+    np.random.seed(42 if seed == 0 else int(seed))
+    n_simulations = N
+    dt      = 1 / trading_days
+    n_steps = int(T * trading_days)
+    drift     = (r - q - 0.5 * sigma ** 2) * dt
+    diffusion = sigma * np.sqrt(dt)
+    Z         = np.random.standard_normal((n_simulations, n_steps))
+    exponent  = drift + diffusion * Z
+    log_S     = np.log(S0) + np.cumsum(exponent, axis=1)
+    S         = np.exp(log_S)
+    S         = np.hstack((np.full((n_simulations, 1), S0), S))
+    final_prices  = S[:, -1]
+    ST            = final_prices
+    avg_ST        = final_prices.mean()
+    std_ST        = final_prices.std()
+    prob_ITM      = np.mean(ST > K)
+    payoffs       = np.maximum(ST - K, 0)
+    mc_price      = np.exp(-r * T) * np.mean(payoffs)
 
-    # Terminal prices (single-step GBM)
-    Z = rng.standard_normal(N)
-    drift = (r - q - 0.5 * sigma**2) * T
-    diffusion = sigma * np.sqrt(T)
-    ST = S0 * np.exp(drift + diffusion * Z)
-
-    # Summary stats
-    avg_ST   = np.mean(ST)
-    std_ST   = np.std(ST)
-    prob_ITM = np.mean(ST > K)
-    payoffs  = np.maximum(ST - K, 0)
-    mc_price = np.exp(-r * T) * np.mean(payoffs)
-
-    # Black-Scholes analytical price
+    # Black-Scholes analytical price & Greeks
     d1 = (np.log(S0 / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
     bs_price = (S0 * np.exp(-q * T) * norm.cdf(d1)
@@ -244,15 +262,14 @@ def run_simulation(S0, K, T, r, q, sigma, N, trading_days, use_paths, seed):
              + q * S0 * np.exp(-q * T) * norm.cdf(d1)) / 365
     rho   = K * T * np.exp(-r * T) * norm.cdf(d2) / 100
 
-    # Step-by-step paths for visualization
+    # Paths for Plotly visualisation — shape (n_steps+1, n_display)
     paths = None
+    paths_sample = None
     if use_paths:
-        n_display = min(500, N)
-        steps = trading_days
-        dt    = T / steps
-        log_ret = ((r - q - 0.5 * sigma**2) * dt
-                   + sigma * np.sqrt(dt) * rng.standard_normal((steps, n_display)))
-        paths = S0 * np.exp(np.vstack([np.zeros(n_display), log_ret]).cumsum(axis=0))
+        n_display    = min(500, n_simulations)
+        paths        = S[:n_display, :].T
+        n_xl         = min(100, n_display)
+        paths_sample = S[:n_xl, :].T   # smaller sample for Excel matplotlib chart
 
     return {
         "ST": ST, "avg_ST": avg_ST, "std_ST": std_ST,
@@ -260,6 +277,7 @@ def run_simulation(S0, K, T, r, q, sigma, N, trading_days, use_paths, seed):
         "bs_price": bs_price, "delta": delta, "gamma": gamma,
         "vega": vega, "theta": theta, "rho": rho,
         "payoffs": payoffs, "paths": paths,
+        "paths_sample": paths_sample,
         "d1": d1, "d2": d2,
     }
 
@@ -527,7 +545,7 @@ def build_excel(S0, K, T, r, q, sigma, N, trading_days, res):
     ws3.add_chart(chart, "D2")
 
     # ────────────────────────────────────────────────
-    #  SHEET 4 – Paths (if available)
+    #  SHEET 4 – Paths data (if available)
     # ────────────────────────────────────────────────
     if res["paths"] is not None:
         ws4 = wb.create_sheet("Sample Paths")
@@ -554,22 +572,58 @@ def build_excel(S0, K, T, r, q, sigma, N, trading_days, res):
             for j in range(n_show):
                 ws4[f"{get_column_letter(j+2)}{i+2}"] = round(float(paths[i, j]), 2)
 
-        # Line chart for paths
-        lc = LineChart()
-        lc.title  = "Sample Simulated Price Paths"
-        lc.y_axis.title = "Stock Price"
-        lc.x_axis.title = "Trading Step"
-        lc.width  = 24
-        lc.height = 14
-        lc.style  = 10
+    # ────────────────────────────────────────────────
+    #  SHEET 5 – Colourful Simulation Paths PLOT (matplotlib)
+    # ────────────────────────────────────────────────
+    if res["paths_sample"] is not None:
+        ws5 = wb.create_sheet("Simulation Paths Plot")
+        ws5.sheet_view.showGridLines = False
 
-        steps_show = min(paths.shape[0], 100)
-        for j in range(min(5, n_show)):
-            col_letter = get_column_letter(j + 2)
-            data_r = Reference(ws4, min_col=j+2, min_row=1, max_row=steps_show+1)
-            lc.add_data(data_r, titles_from_data=True)
+        # Title banner
+        ws5.merge_cells("B2:N2")
+        ws5["B2"] = "Simulated Stock Price Paths  ·  GBM Monte Carlo"
+        ws5["B2"].font      = Font(name="Arial", bold=True, color=C_WHITE, size=14)
+        ws5["B2"].fill      = fill(C_BLUE)
+        ws5["B2"].alignment = align()
+        ws5.row_dimensions[2].height = 28
 
-        ws4.add_chart(lc, f"{get_column_letter(n_show+3)}2")
+        paths_xl = res["paths_sample"]   # (n_steps+1, n_xl)
+        n_xl     = paths_xl.shape[1]
+        n_steps  = paths_xl.shape[0]
+        x_axis   = np.arange(n_steps)
+
+        # Build a vibrant multicolour figure matching the reference image
+        fig_xl, ax = plt.subplots(figsize=(14, 7), facecolor="white")
+        color_maps = [
+            plt.cm.tab20,
+            plt.cm.tab20b,
+            plt.cm.tab20c,
+            plt.cm.Set1,
+            plt.cm.Set2,
+        ]
+        for j in range(n_xl):
+            cmap  = color_maps[(j // 20) % len(color_maps)]
+            color = cmap((j % 20) / 20)
+            ax.plot(x_axis, paths_xl[:, j], linewidth=0.75, alpha=0.80, color=color)
+
+        ax.set_title(f"Simulated Stock Prices Over {T} Years (GBM)  —  {n_xl} paths shown",
+                     fontsize=14, fontweight="bold", pad=12)
+        ax.set_xlabel("Time Steps", fontsize=12)
+        ax.set_ylabel("Stock Price", fontsize=12)
+        ax.tick_params(labelsize=10)
+        ax.grid(True, linestyle="--", alpha=0.3, linewidth=0.5)
+        fig_xl.tight_layout()
+
+        # Save to buffer
+        img_buf = io.BytesIO()
+        fig_xl.savefig(img_buf, format="png", dpi=130, bbox_inches="tight")
+        img_buf.seek(0)
+        plt.close(fig_xl)
+
+        # Embed in worksheet
+        xl_img = XLImage(img_buf)
+        xl_img.anchor = "B4"
+        ws5.add_image(xl_img)
 
     # Save
     buf = io.BytesIO()
@@ -830,6 +884,7 @@ with col_r:
     ✅ Summary Statistics (formulas)<br>
     ✅ Distribution Chart<br>
     ✅ Sample Price Paths sheet<br>
+    ✅ Colourful Simulation Paths Plot<br>
     ✅ Option Greeks
     </div>""", unsafe_allow_html=True)
 
